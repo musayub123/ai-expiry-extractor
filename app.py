@@ -25,4 +25,5 @@ def upload_file():
     return jsonify({"document_type": "Insurance Certificate", "expiry_date": "2025-07-31"})
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=10000)
+
