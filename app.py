@@ -24,6 +24,7 @@ def upload_file():
     # Fake expiry date extraction for demonstration
     return jsonify({"document_type": "Insurance Certificate", "expiry_date": "2025-07-31"})
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+# Remove the entire if __name__ == '__main__': block
+# Just leave this at the bottom of your file
 
+# Your Flask app stays named `app`, which is correct for gunicorn
