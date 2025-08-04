@@ -21,6 +21,17 @@ def upload_file():
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
 
+from extractor import extract_expiry_dates  # assuming you've built or will build this
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    ...
+    file.save(filepath)
+
+    # 👇 This is the real logic you want
+    extracted_data = extract_expiry_dates(filepath)
+
+    return jsonify(extracted_data)
 
 
 # Remove the entire if __name__ == '__main__': block
