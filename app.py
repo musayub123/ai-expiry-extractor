@@ -22,7 +22,17 @@ def upload_file():
     file.save(filepath)
 
     # Fake expiry date extraction for demonstration
-    return jsonify({"document_type": "Insurance Certificate", "expiry_date": "2025-07-31"})
+    return jsonify([
+    {
+        "document_type": "Insurance Certificate",
+        "expiry_date": "2025-07-31"
+    },
+    {
+        "document_type": "Employer Liability",
+        "expiry_date": "2026-01-31"
+    }
+])
+
 
 # Remove the entire if __name__ == '__main__': block
 # Just leave this at the bottom of your file
