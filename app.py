@@ -21,17 +21,6 @@ def upload_file():
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
 
-    # Fake expiry date extraction for demonstration
-    return jsonify([
-    {
-        "document_type": "Insurance Certificate",
-        "expiry_date": "2025-07-31"
-    },
-    {
-        "document_type": "Employer Liability",
-        "expiry_date": "2026-01-31"
-    }
-])
 
 
 # Remove the entire if __name__ == '__main__': block
