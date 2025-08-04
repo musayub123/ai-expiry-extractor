@@ -1,7 +1,7 @@
-
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 import os
+from extractor import extract_expiry_dates  # keep this!
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -21,16 +21,8 @@ def upload_file():
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
 
-from extractor import extract_expiry_dates
+    # 👇 This is the real logic you want
+    extracted_data = extract_expiry_dates(filepath)
 
-...
-
-file.save(filepath)
-results = extract_expiry_dates(filepath)
-return jsonify(results)
-
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=10000)
+    return jsonify(extracted_data)
 
