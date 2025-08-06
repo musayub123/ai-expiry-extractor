@@ -18,8 +18,3 @@ python-dateutil==2.8.2
 
 # Optional for environment configs
 python-dotenv==1.0.0
-
-# Optional: useful for testing
-pytest==7.4.2
-requests==2.31.0
-
