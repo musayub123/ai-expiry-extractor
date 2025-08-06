@@ -1,5 +1,25 @@
-flask
-werkzeug
-gunicorn
-pymupdf
+# Web Framework
+flask==2.3.3
+werkzeug==2.3.7
+gunicorn==21.2.0
+
+# CORS Support
+flask-cors==4.0.0
+
+# PDF Processing
+pymupdf==1.23.8
+
+# OCR and Image Processing
+pytesseract==0.3.10
+pillow==10.0.1
+
+# Date Parsing
+python-dateutil==2.8.2
+
+# Optional for environment configs
+python-dotenv==1.0.0
+
+# Optional: useful for testing
+pytest==7.4.2
+requests==2.31.0
 
