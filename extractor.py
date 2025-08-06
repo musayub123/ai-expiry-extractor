@@ -1,43 +1,70 @@
-# extractor.py
+# extractor.py# extractor.py
 import re
 import fitz  # PyMuPDF
+from datetime import datetime
 
-def extract_expiry_dates(pdf_path):
+
+def extract_text_from_pdf(pdf_path):
     doc = fitz.open(pdf_path)
-    text = ""
+    full_text = ""
     for page in doc:
-        text += page.get_text()
-
+        full_text += page.get_text()
     doc.close()
+    return full_text
 
-    # 🧠 Extract expiry dates using regex
-    date_matches = re.findall(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", text)
-    parsed_dates = [standardize_date(d) for d in date_matches]
 
-    # 🧠 Guess document type
-    doc_type = guess_document_type(text)
+def extract_expiry_date(text):
+    # Try multiple date patterns
+    date_patterns = [
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        r"\b\d{1,2}\s+[A-Za-z]+\s+\d{4}\b",
+    ]
 
-    return [{
-        "document_type": doc_type,
-        "expiry_date": parsed_dates[0] if parsed_dates else None
-    }]
-    
+    for pattern in date_patterns:
+        matches = re.findall(pattern, text)
+        for date_str in matches:
+            std_date = standardize_date(date_str)
+            if std_date:
+                return std_date
+    return None
+
+
 def standardize_date(date_str):
-    from datetime import datetime
-    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y"):
+    formats = [
+        "%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y",
+        "%Y-%m-%d", "%d %B %Y", "%d %b %Y"
+    ]
+    for fmt in formats:
         try:
             return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
-    return date_str  # fallback if format doesn't match
+    return None
+
 
 def guess_document_type(text):
-    if "public liability" in text.lower():
-        return "Public Liability"
-    elif "employer liability" in text.lower():
-        return "Employer Liability"
-    elif "insurance certificate" in text.lower():
-        return "Insurance Certificate"
-    else:
-        return "Unknown"
+    types = [
+        ("Public Liability", ["public liability"]),
+        ("Employer Liability", ["employer liability"]),
+        ("Insurance Certificate", ["insurance certificate", "proof of insurance"]),
+        ("CSCS Card", ["cscs", "construction skills certification"]),
+    ]
 
+    lowered = text.lower()
+    for doc_type, keywords in types:
+        for keyword in keywords:
+            if keyword in lowered:
+                return doc_type
+    return "Unknown"
+
+
+def extract_expiry_dates(pdf_path):
+    text = extract_text_from_pdf(pdf_path)
+    expiry_date = extract_expiry_date(text)
+    doc_type = guess_document_type(text)
+
+    return [{
+        "document_type": doc_type,
+        "expiry_date": expiry_date
+    }]
