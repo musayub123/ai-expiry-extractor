@@ -7,6 +7,7 @@ from dateutil import parser
 from datetime import datetime, timedelta
 import os
 import logging
+import io  # ← ADD THIS MISSING IMPORT
 from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
@@ -465,7 +466,6 @@ class EnhancedDocumentExtractor:
 
 # Usage example
 if __name__ == "__main__":
-    import io
     extractor = EnhancedDocumentExtractor()
     
     # Single file
