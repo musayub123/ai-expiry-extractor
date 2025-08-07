@@ -11,10 +11,15 @@ pymupdf==1.21.1
 
 # OCR and Image Processing
 pytesseract==0.3.10
-pillow==9.5.0
+pillow==9.4.0
 
 # Date Parsing
 python-dateutil==2.8.2
 
-# Optional for environment configs
+# Environment configs
 python-dotenv==1.0.0
+
+# Additional for better AI text extraction
+opencv-python-headless==4.8.1.78
+numpy==1.24.3
+regex==2023.8.8
