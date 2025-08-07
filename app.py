@@ -1,3 +1,57 @@
+#!/usr/bin/env python3
+
+# Add this at the VERY beginning of app.py
+import sys
+import traceback
+import os
+
+print("=== APP STARTUP DEBUG ===")
+print(f"Python version: {sys.version}")
+print(f"Working directory: {os.getcwd()}")
+print(f"Python path: {sys.path}")
+
+try:
+    print("Attempting to import Flask...")
+    from flask import Flask, request, jsonify, send_file
+    print("✓ Flask imported successfully")
+    
+    print("Attempting to import CORS...")
+    from flask_cors import CORS
+    print("✓ CORS imported successfully")
+    
+    print("Attempting to import werkzeug...")
+    from werkzeug.utils import secure_filename
+    from werkzeug.exceptions import RequestEntityTooLarge
+    print("✓ Werkzeug imported successfully")
+    
+    print("Attempting to import standard libraries...")
+    import uuid
+    import logging
+    import time
+    import json
+    from datetime import datetime, timedelta
+    from typing import Dict, List
+    import threading
+    from functools import wraps
+    import hashlib
+    import zipfile
+    import io
+    print("✓ Standard libraries imported successfully")
+    
+    print("Attempting to import extractor...")
+    from extractor import EnhancedDocumentExtractor
+    print("✓ Extractor imported successfully")
+    
+    print("All imports successful - continuing with app setup...")
+    
+except Exception as e:
+    print(f"❌ IMPORT FAILED: {e}")
+    print("Full traceback:")
+    traceback.print_exc()
+    sys.exit(1)
+
+# Your existing app.py code continues here...
+
 # app.py
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
