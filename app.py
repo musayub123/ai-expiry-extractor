@@ -17,8 +17,7 @@ import zipfile
 import io
 
 # Import your enhanced extractor
-from enhanced_extractor import EnhancedDocumentExtractor
-
+from extractor import EnhancedDocumentExtractor
 # ---- CONFIG ----
 class Config:
     UPLOAD_FOLDER = 'uploads'
