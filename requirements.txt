@@ -11,7 +11,7 @@ pymupdf==1.21.1
 
 # OCR and Image Processing
 pytesseract==0.3.10
-pillow==9.4.0
+pillow==10.2.0
 
 # Date Parsing
 python-dateutil==2.8.2
