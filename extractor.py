@@ -7,7 +7,7 @@ from dateutil import parser
 from datetime import datetime, timedelta
 import os
 import logging
-import io  # ← ADD THIS MISSING IMPORT
+import io
 from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
@@ -137,29 +137,47 @@ class DocumentProcessor:
             logger.error(f"Failed to read PDF {pdf_path}: {e}")
             return ""
     
-def extract_text_from_image(self, image_path: str) -> str:
-    """Extract text from image with advanced preprocessing for higher OCR accuracy."""
-    try:
+    def extract_text_from_image(self, image_path: str) -> str:
+        """Extract text from image with advanced preprocessing for higher OCR accuracy."""
+        try:
+            # Fallback to basic PIL processing if cv2 isn't available
+            try:
+                import cv2
+                import numpy as np
+                return self._extract_with_opencv(image_path)
+            except ImportError:
+                logger.warning("OpenCV not available, using basic PIL preprocessing")
+                return self._extract_with_pil(image_path)
+                
+        except Exception as e:
+            logger.error(f"Failed to read image {image_path}: {e}")
+            return ""
+    
+    def _extract_with_opencv(self, image_path: str) -> str:
+        """Extract text using OpenCV for advanced preprocessing"""
         import cv2
         import numpy as np
-
+        
         # Load image with OpenCV
         img_cv = cv2.imread(image_path)
+        if img_cv is None:
+            raise ValueError(f"Could not load image: {image_path}")
 
         # 1. Convert to grayscale
         gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
 
         # 2. Deskew image (detect and rotate to fix tilt)
         coords = np.column_stack(np.where(gray > 0))
-        angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
-        (h, w) = gray.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        if len(coords) > 0:
+            angle = cv2.minAreaRect(coords)[-1]
+            if angle < -45:
+                angle = -(90 + angle)
+            else:
+                angle = -angle
+            (h, w) = gray.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
         # 3. Increase contrast & remove noise
         gray = cv2.equalizeHist(gray)
@@ -189,11 +207,12 @@ def extract_text_from_image(self, image_path: str) -> str:
                 best_text = text
 
         return best_text
-
-    except Exception as e:
-        logger.error(f"Failed to read image {image_path}: {e}")
-        return ""
-
+    
+    def _extract_with_pil(self, image_path: str) -> str:
+        """Extract text using basic PIL preprocessing"""
+        img = Image.open(image_path)
+        img = self.preprocess_image(img)
+        return pytesseract.image_to_string(img, config='--psm 6 -l eng')
     
     def _estimate_ocr_confidence(self, text: str) -> float:
         """Estimate OCR confidence based on text characteristics"""
