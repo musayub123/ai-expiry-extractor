@@ -19,4 +19,4 @@ ENV TESSERACT_CMD=/usr/bin/tesseract
 ENV PORT=10000
 
 # Start with gunicorn (Render exposes $PORT)
-CMD ["gunicorn","--bind","0.0.0.0:$PORT","--log-level","info","app:app"]
+CMD ["/bin/sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-10000} --log-level info app:app"]
