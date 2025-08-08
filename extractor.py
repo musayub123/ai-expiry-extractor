@@ -3,7 +3,7 @@ import re
 import fitz  # PyMuPDF
 import pytesseract
 import os
-pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
 from PIL import Image, ImageEnhance, ImageFilter
 from dateutil import parser
 from datetime import datetime, timedelta
