@@ -72,6 +72,8 @@ import io
 
 # Import your enhanced extractor
 from extractor import EnhancedDocumentExtractor
+extractor = EnhancedDocumentExtractor()
+
 # ---- CONFIG ----
 class Config:
     UPLOAD_FOLDER = 'uploads'
