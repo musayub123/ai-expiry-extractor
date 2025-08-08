@@ -1,13 +1,11 @@
-# extractor.py
+# extractor.py - Clean version
 import re
 import fitz  # PyMuPDF
 import pytesseract
 import os
-pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance
 from dateutil import parser
 from datetime import datetime, timedelta
-import os
 import logging
 import io
 from typing import List, Dict, Optional, Tuple
@@ -15,9 +13,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import time
-import cv2
-import numpy as np
-from pytesseract import Output, TesseractNotFoundError
+
+# Set Tesseract path
+pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
 
 # ---- CONFIG ----
 DATE_CONTEXT_KEYWORDS = {
@@ -85,27 +83,7 @@ class DocumentProcessor:
         cache_file = os.path.join(self.cache_dir, f"{cache_key}.txt")
         with open(cache_file, 'w', encoding='utf-8') as f:
             f.write(text)
-    
-    def preprocess_image(self, image: Image.Image) -> Image.Image:
-        """Optimized image preprocessing for speed"""
-        # Convert to grayscale
-        if image.mode != 'L':
-            image = image.convert('L')
-        
-        # Quick resize to reasonable size (don't go too large)
-        width, height = image.size
-        max_dimension = 1500  # Reduced from 1000+ for speed
-        if width > max_dimension or height > max_dimension:
-            scale = min(max_dimension / width, max_dimension / height)
-            new_size = (int(width * scale), int(height * scale))
-            image = image.resize(new_size, Image.Resampling.LANCZOS)
-        
-        # Basic enhancement only
-        enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(1.3)  # Reduced from 1.5
-        
-        return image
-    
+
     def extract_text_from_pdf(self, pdf_path: str) -> str:
         """Extract text from PDF with fallback to OCR for image-based PDFs"""
         try:
@@ -122,8 +100,7 @@ class DocumentProcessor:
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x scale
                         img_data = pix.tobytes("ppm")
                         img = Image.open(io.BytesIO(img_data))
-                        img = self.preprocess_image(img)
-                        ocr_text = pytesseract.image_to_string(img, config='--psm 6 -l eng')
+                        ocr_text = self._ocr_image(img)
                         text += f"\n--- PAGE {page_num + 1} (OCR) ---\n{ocr_text}\n"
                     except Exception as e:
                         logger.warning(f"OCR failed for page {page_num + 1}: {e}")
@@ -138,89 +115,106 @@ class DocumentProcessor:
             return ""
     
     def extract_text_from_image(self, image_path: str) -> str:
-        """
-        Bare minimum OCR for extremely constrained environments.
-        """
-        logger.info(f"Starting minimal OCR for {image_path}")
+        """Extract text from image file"""
+        try:
+            img = Image.open(image_path)
+            return self._ocr_image(img)
+        except Exception as e:
+            logger.error(f"Failed to read image {image_path}: {e}")
+            return ""
+    
+    def _ocr_image(self, img: Image.Image) -> str:
+        """OCR an image with preprocessing"""
+        logger.info(f"Starting OCR on image size: {img.size}")
         
         try:
             pytesseract.get_tesseract_version()
-        except TesseractNotFoundError:
+        except Exception:
             logger.error("Tesseract not available")
             return ""
         
-        try:
-            # Load and immediately downsize to tiny
-            img = Image.open(image_path)
-            logger.info(f"Original size: {img.size}")
-            
-            # Convert to grayscale
-            if img.mode != 'L':
-                img = img.convert('L')
-            
-            # Make image VERY small for speed
-            tiny_size = 300  # Extremely small
-            img.thumbnail((tiny_size, tiny_size), Image.Resampling.LANCZOS)
-            logger.info(f"Downsized to: {img.size}")
-            
-            # Try the absolute simplest OCR possible
+        # Convert to grayscale
+        if img.mode != 'L':
+            img = img.convert('L')
+        
+        # Only resize if genuinely too large (keep text readable!)
+        width, height = img.size
+        if width > 2000 or height > 2000:
+            scale = min(2000 / width, 2000 / height)
+            new_size = (int(width * scale), int(height * scale))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+            logger.info(f"Resized to: {img.size}")
+        
+        # Basic contrast enhancement
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.2)
+        
+        # Try different PSM modes
+        psm_modes = [6, 4, 3]  # Block, column, auto
+        timeout = int(os.environ.get('OCR_TIMEOUT', '15'))
+        
+        best_text = ""
+        best_score = 0
+        
+        for psm in psm_modes:
             try:
-                logger.info("Attempting minimal OCR...")
+                logger.info(f"Trying PSM {psm}...")
+                config = f'--psm {psm} -l eng --oem 1'
+                
                 text = pytesseract.image_to_string(
                     img,
-                    config='--psm 6',  # Just basic block detection
-                    timeout=15  # Longer timeout but simpler processing
+                    config=config,
+                    timeout=timeout
                 ).strip()
                 
                 if text:
-                    logger.info(f"SUCCESS: Extracted {len(text)} characters")
-                    return text
-                else:
-                    logger.info("OCR returned empty string")
+                    score = self._score_text(text)
+                    logger.info(f"PSM {psm}: {len(text)} chars, score: {score:.3f}")
                     
-            except RuntimeError as e:
-                if "timeout" in str(e).lower():
-                    logger.warning("OCR timed out even at minimal settings")
-                else:
-                    logger.error(f"OCR runtime error: {e}")
-            except Exception as e:
-                logger.error(f"OCR failed: {e}")
-            
-            # If even that failed, try without any config
-            try:
-                logger.info("Trying absolute basic OCR (no config)...")
-                text = pytesseract.image_to_string(img, timeout=20).strip()
+                    if score > best_score:
+                        best_score = score
+                        best_text = text
+                        
+                    # Early exit if we find dates
+                    if re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text):
+                        logger.info(f"Found dates with PSM {psm}")
+                        return text
                 
-                if text:
-                    logger.info(f"Basic OCR SUCCESS: {len(text)} characters")
-                    return text
-                    
             except Exception as e:
-                logger.error(f"Basic OCR also failed: {e}")
-            
-            logger.warning("All OCR attempts failed")
-            return ""
-            
-        except Exception as e:
-            logger.error(f"Fatal error in image processing: {e}")
+                logger.warning(f"PSM {psm} failed: {e}")
+                continue
+        
+        if best_text:
+            logger.info(f"OCR SUCCESS: {len(best_text)} characters")
+            return best_text
+        else:
+            logger.warning("No text extracted")
             return ""
     
-    def _estimate_ocr_confidence(self, text: str) -> float:
-        """Estimate OCR confidence based on text characteristics"""
+    def _score_text(self, text: str) -> float:
+        """Score text quality"""
         if not text.strip():
             return 0.0
         
-        # Count valid words (containing only letters, numbers, common punctuation)
+        score = 0.0
+        
+        # Basic word quality
         words = text.split()
-        valid_words = sum(1 for word in words if re.match(r'^[A-Za-z0-9.,;:!?()-]+$', word))
+        if words:
+            valid_words = sum(1 for word in words if re.match(r'^[A-Za-z0-9.,;:!?()-]+$', word))
+            score += (valid_words / len(words)) * 0.4
         
-        if not words:
-            return 0.0
+        # Date bonus
+        if re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text):
+            score += 0.4
         
-        word_ratio = valid_words / len(words)
-        length_bonus = min(len(text) / 1000, 1.0)  # Bonus for longer text
+        # Insurance keywords bonus
+        text_lower = text.lower()
+        keywords = ['liability', 'insurance', 'certificate', 'policy', 'expiry']
+        found = sum(1 for kw in keywords if kw in text_lower)
+        score += (found / len(keywords)) * 0.2
         
-        return (word_ratio * 0.8 + length_bonus * 0.2)
+        return min(1.0, score)
     
     def get_all_text(self, file_path: str) -> str:
         """Extract text from file with caching"""
@@ -240,12 +234,10 @@ class DocumentProcessor:
         else:
             raise ValueError(f"Unsupported file type: {ext}")
         
-        # Only save to cache if extraction gave something non-empty
+        # Only cache if we got meaningful text
         if text and text.strip():
             self._save_to_cache(cache_key, text)
-        else:
-            logger.info(f"Skipping cache store: empty result for {file_path}")
-
+        
         return text
 
 class DateExtractor:
@@ -255,147 +247,111 @@ class DateExtractor:
             r'\b\d{4}-\d{2}-\d{2}\b',
             r'\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b',
             r'\b\d{1,2}(?:st|nd|rd|th)?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b',
-            r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b'
         ]
     
     def find_all_dates_with_context(self, text: str, window_size: int = 200) -> List[Dict]:
-        """Find all dates with their surrounding context"""
+        """Find all dates with context"""
         candidates = []
-        text_lower = text.lower()
         
-        # Find all date matches first
-        all_matches = []
         for pattern in self.date_patterns:
             for match in re.finditer(pattern, text, re.IGNORECASE):
-                all_matches.append({
-                    'text': match.group(),
-                    'start': match.start(),
-                    'end': match.end()
-                })
-        
-        # For each date, analyze surrounding context
-        for date_match in all_matches:
-            start_pos = max(0, date_match['start'] - window_size)
-            end_pos = min(len(text), date_match['end'] + window_size)
-            context = text[start_pos:end_pos].lower()
-            
-            # Calculate relevance score
-            relevance_score = self._calculate_context_relevance(context, date_match['text'])
-            
-            # Parse the date
-            try:
-                parsed_date = parser.parse(date_match['text'], dayfirst=True)
+                start_pos = max(0, match.start() - window_size)
+                end_pos = min(len(text), match.end() + window_size)
+                context = text[start_pos:end_pos].lower()
                 
-                candidates.append({
-                    'raw_date': date_match['text'],
-                    'parsed_date': parsed_date,
-                    'standardized': parsed_date.strftime('%Y-%m-%d'),
-                    'context': context.strip(),
-                    'relevance_score': relevance_score,
-                    'position': date_match['start'],
-                    'is_future': parsed_date.date() > datetime.now().date()
-                })
-            except Exception as e:
-                logger.debug(f"Failed to parse date '{date_match['text']}': {e}")
-                continue
+                try:
+                    parsed_date = parser.parse(match.group(), dayfirst=True)
+                    relevance = self._calculate_relevance(context, match.group())
+                    
+                    candidates.append({
+                        'raw_date': match.group(),
+                        'parsed_date': parsed_date,
+                        'standardized': parsed_date.strftime('%Y-%m-%d'),
+                        'context': context.strip(),
+                        'relevance_score': relevance,
+                        'is_future': parsed_date.date() > datetime.now().date()
+                    })
+                except Exception as e:
+                    logger.debug(f"Failed to parse date '{match.group()}': {e}")
+                    continue
         
         return candidates
     
-    def _calculate_context_relevance(self, context: str, date_text: str) -> float:
-        """Calculate how relevant a date is based on surrounding context"""
+    def _calculate_relevance(self, context: str, date_text: str) -> float:
+        """Calculate date relevance from context"""
         score = 0.0
         
         # High priority keywords
         for keyword in DATE_CONTEXT_KEYWORDS['high_priority']:
             if keyword in context:
-                # Distance-based scoring
-                keyword_pos = context.find(keyword)
-                date_pos = context.find(date_text.lower())
-                if keyword_pos >= 0 and date_pos >= 0:
-                    distance = abs(keyword_pos - date_pos)
-                    # Closer = higher score
-                    distance_score = max(0, 1.0 - (distance / 100))
-                    score += 0.8 * distance_score
+                score += 0.8
         
-        # Medium priority keywords
+        # Medium priority keywords  
         for keyword in DATE_CONTEXT_KEYWORDS['medium_priority']:
             if keyword in context:
-                keyword_pos = context.find(keyword)
-                date_pos = context.find(date_text.lower())
-                if keyword_pos >= 0 and date_pos >= 0:
-                    distance = abs(keyword_pos - date_pos)
-                    distance_score = max(0, 1.0 - (distance / 150))
-                    score += 0.5 * distance_score
+                score += 0.5
         
-        # Penalty for low priority (issue/start dates)
+        # Penalty for start dates
         for keyword in DATE_CONTEXT_KEYWORDS['low_priority']:
             if keyword in context:
                 score -= 0.3
         
-        # Bonus for table-like structures
-        if ':' in context or 'date' in context:
-            score += 0.2
-        
         return max(0.0, min(1.0, score))
     
     def select_best_expiry_date(self, candidates: List[Dict]) -> Optional[Dict]:
-        """Select the most likely expiry date from candidates"""
+        """Select best expiry date"""
         if not candidates:
             return None
         
-        # Filter out dates more than 10 years in the future (likely errors)
-        max_future_date = datetime.now() + timedelta(days=3650)
-        valid_candidates = [c for c in candidates if c['parsed_date'] <= max_future_date]
+        # Filter reasonable dates
+        max_future = datetime.now() + timedelta(days=3650)  # 10 years
+        valid = [c for c in candidates if c['parsed_date'] <= max_future]
         
-        if not valid_candidates:
+        if not valid:
             return None
         
-        # Calculate final confidence score
-        for candidate in valid_candidates:
-            confidence = candidate['relevance_score'] * 0.6  # Base from context
+        # Score candidates
+        for candidate in valid:
+            confidence = candidate['relevance_score'] * 0.6
             
-            # Bonus for future dates
             if candidate['is_future']:
                 confidence += 0.3
             else:
-                confidence -= 0.2  # Penalty for past dates
+                confidence -= 0.2
             
-            # Bonus for reasonable future dates (6 months to 5 years)
-            days_from_now = (candidate['parsed_date'].date() - datetime.now().date()).days
-            if 180 <= days_from_now <= 1825:  # 6 months to 5 years
+            # Bonus for reasonable future dates
+            days_ahead = (candidate['parsed_date'].date() - datetime.now().date()).days
+            if 180 <= days_ahead <= 1825:  # 6 months to 5 years
                 confidence += 0.1
             
             candidate['final_confidence'] = max(0.0, min(1.0, confidence))
         
-        # Sort by confidence and return best
-        valid_candidates.sort(key=lambda x: x['final_confidence'], reverse=True)
-        return valid_candidates[0]
+        # Return best candidate
+        valid.sort(key=lambda x: x['final_confidence'], reverse=True)
+        return valid[0]
 
 class DocumentTypeClassifier:
     def __init__(self):
         self.patterns = DOCUMENT_PATTERNS
     
     def classify_document(self, text: str) -> Tuple[str, float]:
-        """Classify document type with confidence score"""
+        """Classify document type"""
         text_lower = text.lower()
         best_match = "Unknown"
         best_score = 0.0
         
         for doc_type, config in self.patterns.items():
             score = 0.0
-            keyword_matches = 0
+            matches = 0
             
-            # Check for main keywords
             for keyword in config['keywords']:
                 if keyword in text_lower:
-                    keyword_matches += 1
+                    matches += 1
                     score += config['weight']
             
-            # Bonus for multiple keyword matches
-            if keyword_matches > 1:
+            if matches > 1:
                 score *= 1.2
             
-            # Check for document-specific date contexts
             for context in config.get('date_contexts', []):
                 if context in text_lower:
                     score += 0.3
@@ -413,7 +369,7 @@ class EnhancedDocumentExtractor:
         self.classifier = DocumentTypeClassifier()
     
     def extract_from_file(self, file_path: str) -> Dict:
-        """Extract expiry information from a single file"""
+        """Extract expiry information from file"""
         try:
             # Extract text
             text = self.processor.get_all_text(file_path)
@@ -432,13 +388,11 @@ class EnhancedDocumentExtractor:
             # Classify document
             doc_type, type_confidence = self.classifier.classify_document(text)
             
-            # Find date candidates
+            # Find dates
             candidates = self.date_extractor.find_all_dates_with_context(text)
-            
-            # Select best expiry date
             best_date = self.date_extractor.select_best_expiry_date(candidates)
             
-            # Calculate overall confidence
+            # Calculate confidence
             overall_confidence = 0.0
             if best_date:
                 overall_confidence = (best_date['final_confidence'] + type_confidence) / 2
@@ -475,17 +429,15 @@ class EnhancedDocumentExtractor:
             }
     
     def extract_from_files(self, file_paths: List[str], max_workers: int = 4) -> List[Dict]:
-        """Extract expiry information from multiple files in parallel"""
+        """Extract from multiple files"""
         results = []
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
             future_to_file = {
                 executor.submit(self.extract_from_file, file_path): file_path
                 for file_path in file_paths
             }
             
-            # Collect results
             for future in as_completed(future_to_file):
                 file_path = future_to_file[future]
                 try:
@@ -504,17 +456,3 @@ class EnhancedDocumentExtractor:
                     })
         
         return results
-
-# Usage example
-if __name__ == "__main__":
-    extractor = EnhancedDocumentExtractor()
-    
-    # Single file
-    result = extractor.extract_from_file("path/to/document.pdf")
-    print(json.dumps(result, indent=2, default=str))
-    
-    # Multiple files
-    files = ["doc1.pdf", "doc2.jpg", "doc3.png"]
-    results = extractor.extract_from_files(files)
-    for result in results:
-        print(f"{result['file']}: {result['expiry_date']} (confidence: {result['overall_confidence']:.2f})")
