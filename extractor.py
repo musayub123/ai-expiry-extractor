@@ -144,6 +144,8 @@ class DocumentProcessor:
         import numpy as np
         from PIL import Image
         from pytesseract import Output, TesseractNotFoundError
+        DEBUG_OCR = os.getenv("DEBUG_OCR", "0") == "1"
+
     
         # Sanity: ensure Tesseract is visible
         try:
@@ -188,74 +190,44 @@ class DocumentProcessor:
         thr_otsu = cv2.morphologyEx(thr_otsu, cv2.MORPH_OPEN, k, iterations=1)
     
         # ---- Optional orientation (OSD) with tiny timeout ----
-        variants = [thr_adapt, thr_otsu]
-        try:
-            osd = pytesseract.image_to_osd(Image.fromarray(thr_adapt), timeout=1.0)
-            m = re.search(r"Rotate:\s+(\d+)", osd or "")
-            if m:
-                angle = int(m.group(1)) % 360
-                if angle in (90, 180, 270):
-                    rot = {
-                        90: cv2.ROTATE_90_CLOCKWISE,
-                        180: cv2.ROTATE_180,
-                        270: cv2.ROTATE_90_COUNTERCLOCKWISE
-                    }[angle]
-                    variants = [thr_adapt, thr_otsu,
-                                cv2.rotate(thr_adapt, rot),
-                                cv2.rotate(thr_otsu, rot)]
-        except Exception:
-            # Orientation is optional; ignore timeouts/errors
-            pass
-    
+        # ---- Build multiple variants quickly ----
+        # Include: plain sharpened gray, Otsu, adaptive, and inverted-Otsu
+        variants = [sharp, thr_otsu, thr_adapt, cv2.bitwise_not(thr_otsu)]
+        
+        # Save debug variants if enabled
+        if DEBUG_OCR:
+            try:
+                os.makedirs("results", exist_ok=True)
+                for i, v in enumerate(variants):
+                    cv2.imwrite(f"results/_debug_variant_{i}.png", v)
+            except Exception:
+                pass
+
         # ---- OCR config set ----
-        base_cfg = "-l eng --oem 1 -c preserve_interword_spaces=1 -c user_defined_dpi=300"
-        psms = ["6", "4", "11", "3"]  # block, single column, sparse, auto
-    
-        deadline = time.monotonic() + 4.5  # hard cap for whole function
+        base_cfg = "-l eng --oem 3 -c preserve_interword_spaces=1 -c user_defined_dpi=300"
+        psms = ["6", "4", "12", "11", "7", "3"]  # more layouts covered
+        deadline = time.monotonic() + 5.5  # small bump in total time
+        rd cap for whole function
         best_text = ""
         best_score = -1.0
     
-        def run_ocr(pil_img, psm, per_call_timeout=1.2):
-            # Use image_to_data to get confidences (more reliable ranking)
-            data = pytesseract.image_to_data(
-                pil_img,
-                config=f"{base_cfg} --psm {psm}",
-                output_type=Output.DICT,
-                timeout=per_call_timeout
-            )
-            # Collect words and confidences (ignore conf == -1)
-            words = [w for w in data.get("text", [])]
-            confs = [int(c) for c in data.get("conf", []) if c != '-1']
-            text = " ".join(w for w in words if w and w.strip())
-            mean_conf = (float(np.mean(confs)) if confs else 0.0)
-            # Score combines confidence and length (cheap heuristic)
-            score = mean_conf + 0.1 * min(len(text), 200)  # length capped to avoid bias
-            return text, score, mean_conf
-    
-        # ---- Try variants/psms with aggressive early-exit ----
-        for psm in psms:
-            for var in variants:
-                if time.monotonic() > deadline:
-                    break
-                pil = Image.fromarray(var)
-                try:
-                    text, score, mean_conf = run_ocr(pil, psm)
-                    if score > best_score:
-                        best_score, best_text = score, text
-                    # Early exit when it’s clearly good
-                    if mean_conf >= 65 and len(text) >= 80:
-                        return text
-                except RuntimeError as e:
-                    # pytesseract raises RuntimeError on timeout
-                    if "timeout" in str(e).lower():
-                        continue
-                    logger.warning(f"OCR runtime error (psm={psm}): {e}")
-                    continue
-                except Exception as e:
-                    logger.debug(f"OCR failed (psm={psm}): {e}")
-                    continue
-    
-        return best_text.strip()
+    def run_ocr(pil_img, psm, per_call_timeout=1.6):
+        # Use image_to_data to get confidences (more reliable ranking)
+        data = pytesseract.image_to_data(
+            pil_img,
+            config=f"{base_cfg} --psm {psm}",
+            output_type=Output.DICT,
+            timeout=per_call_timeout
+        )
+        # Collect words and confidences (ignore conf == -1)
+        words = [w for w in data.get("text", [])]
+        confs = [int(c) for c in data.get("conf", []) if c != '-1']
+        text = " ".join(w for w in words if w and w.strip())
+        mean_conf = (float(np.mean(confs)) if confs else 0.0)
+        # Score combines confidence and length (cheap heuristic)
+        score = mean_conf + 0.1 * min(len(text), 200)  # length capped to avoid bias
+        logger.info(f"OCR try psm={psm}, len={len(text)}, mean_conf={mean_conf:.1f}")
+        return text, score, mean_conf
 
     
     def _extract_with_opencv(self, image_path: str) -> str:
