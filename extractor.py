@@ -134,47 +134,47 @@ class DocumentProcessor:
             return ""
     
     def extract_text_from_image(self, image_path: str) -> str:
-    """Extract text from image with timeout protection"""
-    import signal
-    
-    class TimeoutError(Exception):
-        pass
-    
-    def timeout_handler(signum, frame):
-        raise TimeoutError("OCR processing timeout")
-    
-    try:
-        # Set 20-second total timeout for entire image processing
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(20)
+        """Extract text from image with timeout protection"""
+        import signal
         
-        # Check Tesseract availability
-        try:
-            pytesseract.get_tesseract_version()
-        except pytesseract.TesseractNotFoundError:
-            raise Exception("Tesseract OCR is not installed")
+        class TimeoutError(Exception):
+            pass
         
-        # Try OpenCV first, fallback to PIL
+        def timeout_handler(signum, frame):
+            raise TimeoutError("OCR processing timeout")
+        
         try:
-            import cv2
-            result = self._extract_with_opencv(image_path)
-        except ImportError:
-            logger.warning("OpenCV not available, using PIL")
-            result = self._extract_with_pil(image_path)
+            # Set 20-second total timeout for entire image processing
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(20)
+            
+            # Check Tesseract availability
+            try:
+                pytesseract.get_tesseract_version()
+            except pytesseract.TesseractNotFoundError:
+                raise Exception("Tesseract OCR is not installed")
+            
+            # Try OpenCV first, fallback to PIL
+            try:
+                import cv2
+                result = self._extract_with_opencv(image_path)
+            except ImportError:
+                logger.warning("OpenCV not available, using PIL")
+                result = self._extract_with_pil(image_path)
+            except TimeoutError:
+                logger.warning("OpenCV OCR timed out, trying PIL fallback")
+                result = self._extract_with_pil(image_path)
+            
+            return result
+            
         except TimeoutError:
-            logger.warning("OpenCV OCR timed out, trying PIL fallback")
-            result = self._extract_with_pil(image_path)
-        
-        return result
-        
-    except TimeoutError:
-        logger.error(f"Total OCR timeout for {image_path}")
-        return ""
-    except Exception as e:
-        logger.error(f"OCR failed for {image_path}: {e}")
-        return ""
-    finally:
-        signal.alarm(0)  # Cancel the alarm
+            logger.error(f"Total OCR timeout for {image_path}")
+            return ""
+        except Exception as e:
+            logger.error(f"OCR failed for {image_path}: {e}")
+            return ""
+        finally:
+            signal.alarm(0)  # Cancel the alarm
     
     def _extract_with_opencv(self, image_path: str) -> str:
     """Fast OCR with timeout and multiple fallbacks"""
