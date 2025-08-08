@@ -360,7 +360,12 @@ class DocumentProcessor:
         else:
             raise ValueError(f"Unsupported file type: {ext}")
         
-        self._save_to_cache(cache_key, text)
+                # Only save to cache if OCR/PDF extraction gave something non-empty
+        if text and text.strip():
+            self._save_to_cache(cache_key, text)
+        else:
+            logger.info(f"Skipping cache store: empty result for {file_path}")
+
         return text
 
 class DateExtractor:
