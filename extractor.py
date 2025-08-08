@@ -457,9 +457,11 @@ class EnhancedDateExtractor:
                     confidence -= 0.1
             
             # Position bonus (15% weight) - later in document often means expiry
-            text_position_ratio = candidate['position'] / max(1, len(candidate['context']))
-            if text_position_ratio > 0.3:  # In latter part of document
-                confidence += 0.15 * text_position_ratio
+            context_len = len(candidate.get('context', ''))
+            if context_len > 0:
+                text_position_ratio = candidate['position'] / context_len
+                if text_position_ratio > 0.3:  # In latter part of document
+                    confidence += 0.15 * text_position_ratio
             
             # Line context quality (20% weight)
             line_lower = candidate['line_context'].lower()
@@ -468,15 +470,18 @@ class EnhancedDateExtractor:
             elif any(keyword in line_lower for keyword in DATE_CONTEXT_KEYWORDS['expiry_medium']):
                 confidence += 0.1
             
+            # THIS IS THE CRITICAL LINE THAT WAS MISSING/MISPLACED:
             candidate['final_confidence'] = max(0.0, min(1.0, confidence))
         
         # Sort by confidence and return best
         valid_candidates.sort(key=lambda x: x['final_confidence'], reverse=True)
         
-        best = valid_candidates[0]
-        logger.info(f"Selected date: {best['raw_date']} with confidence: {best['final_confidence']:.3f}")
+        if valid_candidates:
+            best = valid_candidates[0]
+            logger.info(f"Selected date: {best['raw_date']} with confidence: {best['final_confidence']:.3f}")
+            return best
         
-        return best
+        return None
 
 class AdvancedDocumentClassifier:
     def __init__(self):
