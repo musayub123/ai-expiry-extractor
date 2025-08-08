@@ -156,64 +156,64 @@ class DocumentProcessor:
             return ""
     
     def _extract_with_opencv(self, image_path: str) -> str:
-        """Extract text using OpenCV for advanced preprocessing"""
-        import cv2
-        import numpy as np
-        
-        # Load image with OpenCV
-        img_cv = cv2.imread(image_path)
-        if img_cv is None:
-            raise ValueError(f"Could not load image: {image_path}")
-
-        # 1. Convert to grayscale
-        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-
-        # 2. Deskew image (detect and rotate to fix tilt)
-        coords = np.column_stack(np.where(gray > 0))
-        if len(coords) > 0:
-            angle = cv2.minAreaRect(coords)[-1]
-            if angle < -45:
-                angle = -(90 + angle)
-            else:
-                angle = -angle
-            (h, w) = gray.shape[:2]
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
-        # 3. Increase contrast & remove noise
-        gray = cv2.equalizeHist(gray)
-        gray = cv2.fastNlMeansDenoising(gray, None, 30, 7, 21)
-
-        # 4. Adaptive thresholding (handles light backgrounds)
-        thresh = cv2.adaptiveThreshold(gray, 255,
-                                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, 31, 2)
-
-        # 5. Convert to PIL for pytesseract
-        pil_img = Image.fromarray(thresh)
-
-        # Use faster OCR configs prioritizing speed
-        configs = [
-            '--psm 6 -l eng --oem 1',  # Fast engine, block of text
-            '--psm 4 -l eng --oem 1'   # Fast engine, single column
-        ]
-        best_text = ""
-        best_confidence = 0
-        for config in configs:
-            try:
-                text = pytesseract.image_to_string(pil_img, config=config, timeout=10)
-                confidence = self._estimate_ocr_confidence(text)
-                if confidence > best_confidence:
-                    best_confidence = confidence
-                    best_text = text
-                    if confidence > 0.7:  # Stop early if we get good results
-                        break
-            except Exception as e:
-                logger.warning(f"OCR config {config} failed: {e}")
+    """Fast OCR with timeout and multiple fallbacks"""
+    import cv2
+    import numpy as np
+    
+    # Load image
+    img_cv = cv2.imread(image_path)
+    if img_cv is None:
+        raise ValueError(f"Could not load image: {image_path}")
+    
+    # Simple, fast preprocessing only
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    
+    # Quick resize if too large (major speed improvement)
+    height, width = gray.shape
+    if max(height, width) > 2000:
+        scale = 2000 / max(height, width)
+        new_w, new_h = int(width * scale), int(height * scale)
+        gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # Fast OCR configs with timeout
+    configs = [
+        '--psm 6 -l eng --oem 3',  # Most common case
+        '--psm 4 -l eng --oem 3',  # Fallback
+        '--psm 3 -l eng --oem 3'   # Last resort
+    ]
+    
+    best_text = ""
+    
+    for config in configs:
+        try:
+            # Convert to PIL for pytesseract
+            pil_img = Image.fromarray(gray)
+            
+            # Add timeout - this is crucial!
+            text = pytesseract.image_to_string(
+                pil_img, 
+                config=config, 
+                timeout=8  # 8 second timeout per attempt
+            ).strip()
+            
+            if len(text) > len(best_text):
+                best_text = text
+                
+            # Early exit if we get decent text
+            if len(text) > 50:
+                logger.info(f"OCR succeeded with config: {config}")
+                break
+                
+        except pytesseract.TesseractError as e:
+            logger.warning(f"OCR config {config} failed: {e}")
+            continue
+        except RuntimeError as e:
+            if "timeout" in str(e).lower():
+                logger.warning(f"OCR config {config} timed out")
                 continue
-
-        return best_text
+            raise
+    
+    return best_text
     
     def _extract_with_pil(self, image_path: str) -> str:
         """Extract text using basic PIL preprocessing"""
