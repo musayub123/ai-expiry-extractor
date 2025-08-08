@@ -139,145 +139,92 @@ class DocumentProcessor:
     
     def extract_text_from_image(self, image_path: str) -> str:
         """
-        Robust OCR optimized for Render's free tier - handles timeouts gracefully.
+        Ultra-fast OCR for Render free tier - minimal processing, maximum speed.
         """
-        DEBUG_OCR = os.getenv("DEBUG_OCR", "0") == "1"
+        logger.info(f"Starting fast OCR for {image_path}")
         
-        # Ensure Tesseract is available
         try:
             pytesseract.get_tesseract_version()
         except TesseractNotFoundError:
-            logger.error("Tesseract OCR is not installed/visible at runtime")
+            logger.error("Tesseract not available")
             return ""
         
         try:
-            # Load and preprocess image
-            img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                logger.error(f"Could not load image: {image_path}")
-                return ""
+            # Load with PIL (simpler than OpenCV)
+            img = Image.open(image_path)
             
-            h, w = img.shape[:2]
-            logger.info(f"Processing image {image_path}: {w}x{h}")
+            # Convert to grayscale
+            if img.mode != 'L':
+                img = img.convert('L')
             
-            # Aggressive size reduction for speed on free tier
-            max_size = 1200  # Smaller for speed
-            if max(h, w) > max_size:
-                scale = max_size / max(h, w)
-                new_w, new_h = int(w * scale), int(h * scale)
-                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                logger.info(f"Resized to {new_w}x{new_h} for speed")
+            original_size = img.size
+            logger.info(f"Original size: {original_size}")
             
-            # Simple but effective preprocessing
-            # 1. Enhance contrast
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            img = clahe.apply(img)
+            # Aggressive downscaling for speed
+            max_dim = 800  # Very small for speed
+            if max(img.size) > max_dim:
+                img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+                logger.info(f"Resized to: {img.size}")
             
-            # 2. Denoise
-            img = cv2.fastNlMeansDenoising(img, h=10)
-            
-            # 3. Create variants - but fewer of them
-            variants = []
-            
-            # Original enhanced
-            variants.append(("enhanced", img))
-            
-            # Otsu threshold
-            _, otsu = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            variants.append(("otsu", otsu))
-            
-            # Adaptive threshold
-            adaptive = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-            variants.append(("adaptive", adaptive))
-            
-            # Save debug if needed
-            if DEBUG_OCR:
-                try:
-                    os.makedirs("results", exist_ok=True)
-                    for i, (name, variant) in enumerate(variants):
-                        cv2.imwrite(f"results/_debug_{name}.png", variant)
-                except Exception:
-                    pass
-            
-            # Simplified OCR configs - focus on most reliable ones
-            configs = [
-                ("--psm 6 -l eng --oem 3", "block"),
-                ("--psm 4 -l eng --oem 3", "column"),  
-                ("--psm 3 -l eng --oem 3", "auto")
-            ]
-            
-            best_text = ""
-            best_len = 0
-            timeout_per_try = 8.0  # Longer timeout per attempt
-            
-            # Try each variant with each config
-            for variant_name, variant_img in variants:
-                pil_img = Image.fromarray(variant_img)
+            # Try just ONE fast approach first
+            try:
+                logger.info("Trying ultra-fast basic OCR...")
+                text = pytesseract.image_to_string(
+                    img, 
+                    config='--psm 6 -l eng --oem 1 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz./-: ',
+                    timeout=5
+                ).strip()
                 
-                for config, config_name in configs:
-                    try:
-                        start = time.time()
-                        text = pytesseract.image_to_string(
-                            pil_img, 
-                            config=config,
-                            timeout=timeout_per_try
-                        ).strip()
-                        
-                        elapsed = time.time() - start
-                        logger.info(f"OCR {variant_name}+{config_name}: {len(text)} chars in {elapsed:.1f}s")
-                        
-                        # Keep the longest reasonable result
-                        if len(text) > best_len and len(text) > 10:  # At least 10 chars
-                            best_text = text
-                            best_len = len(text)
-                            
-                        # Early exit if we got good text
-                        if len(text) > 100:
-                            logger.info(f"Good result found early: {len(text)} characters")
-                            return text
-                            
-                    except RuntimeError as e:
-                        if "timeout" in str(e).lower():
-                            logger.warning(f"OCR timeout: {variant_name}+{config_name}")
-                        else:
-                            logger.warning(f"OCR error: {variant_name}+{config_name}: {e}")
-                        continue
-                    except Exception as e:
-                        logger.debug(f"OCR failed: {variant_name}+{config_name}: {e}")
-                        continue
-            
-            # Fallback: Try simple approach if nothing worked
-            if not best_text or len(best_text) < 20:
-                logger.info("Trying fallback simple OCR...")
-                try:
-                    # Very simple approach
-                    pil_simple = Image.open(image_path).convert('L')
-                    # Resize if too big
-                    if max(pil_simple.size) > 1000:
-                        pil_simple.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+                if len(text) > 20:
+                    logger.info(f"Fast OCR success: {len(text)} chars")
+                    return text
                     
-                    fallback_text = pytesseract.image_to_string(
-                        pil_simple, 
-                        config='--psm 6 -l eng',
-                        timeout=10
-                    ).strip()
-                    
-                    if len(fallback_text) > len(best_text):
-                        best_text = fallback_text
-                        logger.info(f"Fallback OCR worked: {len(best_text)} chars")
-                        
-                except Exception as e:
-                    logger.debug(f"Fallback OCR also failed: {e}")
+            except Exception as e:
+                logger.warning(f"Fast OCR failed: {e}")
             
-            if best_text and len(best_text) > 5:
-                logger.info(f"OCR completed successfully: {len(best_text)} characters extracted")
-                return best_text
-            else:
-                logger.warning(f"OCR failed to extract meaningful text from {image_path}")
-                return ""
+            # If that didn't work, try minimal preprocessing
+            try:
+                logger.info("Trying with basic enhancement...")
+                # Very simple enhancement
+                enhanced = img.point(lambda x: x * 1.2 if x < 128 else x)  # Simple contrast
                 
+                text = pytesseract.image_to_string(
+                    enhanced,
+                    config='--psm 4 -l eng --oem 1',
+                    timeout=5  
+                ).strip()
+                
+                if len(text) > 10:
+                    logger.info(f"Enhanced OCR success: {len(text)} chars")
+                    return text
+                    
+            except Exception as e:
+                logger.warning(f"Enhanced OCR failed: {e}")
+            
+            # Last resort: try even smaller image
+            try:
+                logger.info("Trying ultra-small image...")
+                tiny_img = img.copy()
+                tiny_img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+                
+                text = pytesseract.image_to_string(
+                    tiny_img,
+                    config='--psm 6',
+                    timeout=3
+                ).strip()
+                
+                if len(text) > 5:
+                    logger.info(f"Tiny OCR success: {len(text)} chars")
+                    return text
+                    
+            except Exception as e:
+                logger.warning(f"Tiny OCR failed: {e}")
+            
+            logger.warning("All OCR attempts failed")
+            return ""
+            
         except Exception as e:
-            logger.error(f"Fatal error in OCR processing for {image_path}: {e}")
+            logger.error(f"OCR processing error: {e}")
             return ""
     
     def _estimate_ocr_confidence(self, text: str) -> float:
