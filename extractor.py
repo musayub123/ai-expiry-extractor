@@ -81,28 +81,22 @@ class DocumentProcessor:
             f.write(text)
     
     def preprocess_image(self, image: Image.Image) -> Image.Image:
-        """Enhanced image preprocessing for better OCR"""
+        """Optimized image preprocessing for speed"""
         # Convert to grayscale
         if image.mode != 'L':
             image = image.convert('L')
         
-        # Enhance contrast
-        enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(1.5)
-        
-        # Enhance sharpness
-        enhancer = ImageEnhance.Sharpness(image)
-        image = enhancer.enhance(2.0)
-        
-        # Apply slight blur to reduce noise
-        image = image.filter(ImageFilter.MedianFilter(size=3))
-        
-        # Resize if too small (OCR works better on larger images)
+        # Quick resize to reasonable size (don't go too large)
         width, height = image.size
-        if width < 1000 or height < 1000:
-            scale = max(1000 / width, 1000 / height)
+        max_dimension = 1500  # Reduced from 1000+ for speed
+        if width > max_dimension or height > max_dimension:
+            scale = min(max_dimension / width, max_dimension / height)
             new_size = (int(width * scale), int(height * scale))
             image = image.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # Basic enhancement only
+        enhancer = ImageEnhance.Contrast(image)
+        image = enhancer.enhance(1.3)  # Reduced from 1.5
         
         return image
     
@@ -140,6 +134,12 @@ class DocumentProcessor:
     def extract_text_from_image(self, image_path: str) -> str:
         """Extract text from image with advanced preprocessing for higher OCR accuracy."""
         try:
+            # Check if Tesseract is available
+            try:
+                pytesseract.get_tesseract_version()
+            except pytesseract.TesseractNotFoundError:
+                raise Exception("Tesseract OCR is not installed. Please install tesseract-ocr package.")
+            
             # Fallback to basic PIL processing if cv2 isn't available
             try:
                 import cv2
@@ -191,20 +191,25 @@ class DocumentProcessor:
         # 5. Convert to PIL for pytesseract
         pil_img = Image.fromarray(thresh)
 
-        # 6. Try multiple OCR configurations & pick best
+        # Use faster OCR configs prioritizing speed
         configs = [
-            '--psm 6 -l eng',  # block of text
-            '--psm 4 -l eng',  # single column
-            '--psm 3 -l eng'   # auto
+            '--psm 6 -l eng --oem 1',  # Fast engine, block of text
+            '--psm 4 -l eng --oem 1'   # Fast engine, single column
         ]
         best_text = ""
         best_confidence = 0
         for config in configs:
-            text = pytesseract.image_to_string(pil_img, config=config)
-            confidence = self._estimate_ocr_confidence(text)
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_text = text
+            try:
+                text = pytesseract.image_to_string(pil_img, config=config, timeout=10)
+                confidence = self._estimate_ocr_confidence(text)
+                if confidence > best_confidence:
+                    best_confidence = confidence
+                    best_text = text
+                    if confidence > 0.7:  # Stop early if we get good results
+                        break
+            except Exception as e:
+                logger.warning(f"OCR config {config} failed: {e}")
+                continue
 
         return best_text
     
@@ -212,7 +217,8 @@ class DocumentProcessor:
         """Extract text using basic PIL preprocessing"""
         img = Image.open(image_path)
         img = self.preprocess_image(img)
-        return pytesseract.image_to_string(img, config='--psm 6 -l eng')
+        # Use faster OCR config for speed
+        return pytesseract.image_to_string(img, config='--psm 6 -l eng --oem 1 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz./-: ')
     
     def _estimate_ocr_confidence(self, text: str) -> float:
         """Estimate OCR confidence based on text characteristics"""
