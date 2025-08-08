@@ -1,22 +1,30 @@
 FROM python:3.11-slim
 
-# System deps: Tesseract + libs Pillow/PyMuPDF like
+# Essential OCR packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr tesseract-ocr-eng libglib2.0-0 libsm6 libxrender1 libxext6 \
- && rm -rf /var/lib/apt/lists/*
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-osd \
+    libtesseract-dev \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set tessdata path
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+ENV TESSERACT_CMD=/usr/bin/tesseract
 
 WORKDIR /app
 
-# Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code
 COPY . .
 
-# (Optional but safe) point pytesseract to the binary
-ENV TESSERACT_CMD=/usr/bin/tesseract
-ENV PORT=10000
+# Performance settings for Render free tier
+ENV OMP_NUM_THREADS=2
+ENV OPENCV_LOG_LEVEL=ERROR
 
-# Start with gunicorn (Render exposes $PORT)
-CMD ["/bin/sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-10000} --log-level info app:app"]
+CMD gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 30 --keep-alive 2 app:app
