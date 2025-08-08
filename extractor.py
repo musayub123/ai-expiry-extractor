@@ -137,37 +137,63 @@ class DocumentProcessor:
             logger.error(f"Failed to read PDF {pdf_path}: {e}")
             return ""
     
-    def extract_text_from_image(self, image_path: str) -> str:
-        """Extract text from image with enhanced preprocessing"""
-        try:
-            image = Image.open(image_path)
-            image = self.preprocess_image(image)
-            
-            # Try multiple OCR configurations
-            configs = [
-                '--psm 6 -l eng',  # Assume uniform block of text
-                '--psm 4 -l eng',  # Assume single column of text
-                '--psm 3 -l eng'   # Default, automatic page segmentation
-            ]
-            
-            best_text = ""
-            best_confidence = 0
-            
-            for config in configs:
-                try:
-                    text = pytesseract.image_to_string(image, config=config)
-                    # Simple confidence estimation based on text length and structure
-                    confidence = self._estimate_ocr_confidence(text)
-                    if confidence > best_confidence:
-                        best_confidence = confidence
-                        best_text = text
-                except Exception:
-                    continue
-            
-            return best_text
-        except Exception as e:
-            logger.error(f"Failed to read image {image_path}: {e}")
-            return ""
+def extract_text_from_image(self, image_path: str) -> str:
+    """Extract text from image with advanced preprocessing for higher OCR accuracy."""
+    try:
+        import cv2
+        import numpy as np
+
+        # Load image with OpenCV
+        img_cv = cv2.imread(image_path)
+
+        # 1. Convert to grayscale
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+
+        # 2. Deskew image (detect and rotate to fix tilt)
+        coords = np.column_stack(np.where(gray > 0))
+        angle = cv2.minAreaRect(coords)[-1]
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        (h, w) = gray.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+        # 3. Increase contrast & remove noise
+        gray = cv2.equalizeHist(gray)
+        gray = cv2.fastNlMeansDenoising(gray, None, 30, 7, 21)
+
+        # 4. Adaptive thresholding (handles light backgrounds)
+        thresh = cv2.adaptiveThreshold(gray, 255,
+                                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 31, 2)
+
+        # 5. Convert to PIL for pytesseract
+        pil_img = Image.fromarray(thresh)
+
+        # 6. Try multiple OCR configurations & pick best
+        configs = [
+            '--psm 6 -l eng',  # block of text
+            '--psm 4 -l eng',  # single column
+            '--psm 3 -l eng'   # auto
+        ]
+        best_text = ""
+        best_confidence = 0
+        for config in configs:
+            text = pytesseract.image_to_string(pil_img, config=config)
+            confidence = self._estimate_ocr_confidence(text)
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_text = text
+
+        return best_text
+
+    except Exception as e:
+        logger.error(f"Failed to read image {image_path}: {e}")
+        return ""
+
     
     def _estimate_ocr_confidence(self, text: str) -> float:
         """Estimate OCR confidence based on text characteristics"""
