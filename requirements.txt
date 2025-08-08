@@ -1,25 +1,11 @@
-# Web Framework
 flask==2.3.3
-werkzeug==2.3.7
-gunicorn==21.2.0
-
-# CORS Support
 flask-cors==4.0.0
-
-# PDF Processing
+gunicorn==21.2.0
 pymupdf==1.21.1
-
-# OCR and Image Processing
 pytesseract==0.3.10
 pillow==10.2.0
-
-# Date Parsing
 python-dateutil==2.8.2
-
-# Environment configs
 python-dotenv==1.0.0
-
-# Additional for better AI text extraction
 opencv-python-headless==4.8.1.78
 numpy==1.24.3
 regex==2023.8.8
