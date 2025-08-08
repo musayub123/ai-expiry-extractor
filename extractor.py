@@ -177,64 +177,64 @@ class DocumentProcessor:
             signal.alarm(0)  # Cancel the alarm
     
     def _extract_with_opencv(self, image_path: str) -> str:
-    """Fast OCR with timeout and multiple fallbacks"""
-    import cv2
-    import numpy as np
-    
-    # Load image
-    img_cv = cv2.imread(image_path)
-    if img_cv is None:
-        raise ValueError(f"Could not load image: {image_path}")
-    
-    # Simple, fast preprocessing only
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    
-    # Quick resize if too large (major speed improvement)
-    height, width = gray.shape
-    if max(height, width) > 2000:
-        scale = 2000 / max(height, width)
-        new_w, new_h = int(width * scale), int(height * scale)
-        gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    
-    # Fast OCR configs with timeout
-    configs = [
-        '--psm 6 -l eng --oem 3',  # Most common case
-        '--psm 4 -l eng --oem 3',  # Fallback
-        '--psm 3 -l eng --oem 3'   # Last resort
-    ]
-    
-    best_text = ""
-    
-    for config in configs:
-        try:
-            # Convert to PIL for pytesseract
-            pil_img = Image.fromarray(gray)
-            
-            # Add timeout - this is crucial!
-            text = pytesseract.image_to_string(
-                pil_img, 
-                config=config, 
-                timeout=8  # 8 second timeout per attempt
-            ).strip()
-            
-            if len(text) > len(best_text):
-                best_text = text
+        """Fast OCR with timeout and multiple fallbacks"""
+        import cv2
+        import numpy as np
+        
+        # Load image
+        img_cv = cv2.imread(image_path)
+        if img_cv is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        # Simple, fast preprocessing only
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        
+        # Quick resize if too large (major speed improvement)
+        height, width = gray.shape
+        if max(height, width) > 2000:
+            scale = 2000 / max(height, width)
+            new_w, new_h = int(width * scale), int(height * scale)
+            gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # Fast OCR configs with timeout
+        configs = [
+            '--psm 6 -l eng --oem 3',  # Most common case
+            '--psm 4 -l eng --oem 3',  # Fallback
+            '--psm 3 -l eng --oem 3'   # Last resort
+        ]
+        
+        best_text = ""
+        
+        for config in configs:
+            try:
+                # Convert to PIL for pytesseract
+                pil_img = Image.fromarray(gray)
                 
-            # Early exit if we get decent text
-            if len(text) > 50:
-                logger.info(f"OCR succeeded with config: {config}")
-                break
+                # Add timeout - this is crucial!
+                text = pytesseract.image_to_string(
+                    pil_img, 
+                    config=config, 
+                    timeout=8  # 8 second timeout per attempt
+                ).strip()
                 
-        except pytesseract.TesseractError as e:
-            logger.warning(f"OCR config {config} failed: {e}")
-            continue
-        except RuntimeError as e:
-            if "timeout" in str(e).lower():
-                logger.warning(f"OCR config {config} timed out")
+                if len(text) > len(best_text):
+                    best_text = text
+                    
+                # Early exit if we get decent text
+                if len(text) > 50:
+                    logger.info(f"OCR succeeded with config: {config}")
+                    break
+                    
+            except pytesseract.TesseractError as e:
+                logger.warning(f"OCR config {config} failed: {e}")
                 continue
-            raise
-    
-    return best_text
+            except RuntimeError as e:
+                if "timeout" in str(e).lower():
+                    logger.warning(f"OCR config {config} timed out")
+                    continue
+                raise
+        
+        return best_text
     
     def _extract_with_pil(self, image_path: str) -> str:
         """Extract text using basic PIL preprocessing"""
