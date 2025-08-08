@@ -139,7 +139,7 @@ class DocumentProcessor:
     
     def extract_text_from_image(self, image_path: str) -> str:
         """
-        Enhanced OCR for typical UK insurance certificates with multiple preprocessing variants.
+        Robust OCR optimized for Render's free tier - handles timeouts gracefully.
         """
         DEBUG_OCR = os.getenv("DEBUG_OCR", "0") == "1"
         
@@ -151,7 +151,7 @@ class DocumentProcessor:
             return ""
         
         try:
-            # Load image in grayscale
+            # Load and preprocess image
             img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
             if img is None:
                 logger.error(f"Could not load image: {image_path}")
@@ -160,154 +160,118 @@ class DocumentProcessor:
             h, w = img.shape[:2]
             logger.info(f"Processing image {image_path}: {w}x{h}")
             
-            # Size normalization - upscale small images, downscale huge ones
-            max_target = 1800
-            min_target = 900
-            longest = max(h, w)
-            
-            if longest < min_target:
-                scale = min(max_target / float(longest), 2.5)  # cap upscaling
-                new_w, new_h = int(w * scale), int(h * scale)
-                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-                logger.info(f"Upscaled to {new_w}x{new_h}")
-            elif longest > 2000:
-                scale = 2000 / float(longest)
+            # Aggressive size reduction for speed on free tier
+            max_size = 1200  # Smaller for speed
+            if max(h, w) > max_size:
+                scale = max_size / max(h, w)
                 new_w, new_h = int(w * scale), int(h * scale)
                 img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                logger.info(f"Downscaled to {new_w}x{new_h}")
+                logger.info(f"Resized to {new_w}x{new_h} for speed")
             
-            # Light denoise + unsharp mask
-            blur = cv2.GaussianBlur(img, (0, 0), 1.0)
-            sharp = cv2.addWeighted(img, 1.5, blur, -0.5, 0)
+            # Simple but effective preprocessing
+            # 1. Enhance contrast
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            img = clahe.apply(img)
             
-            # Create multiple preprocessing variants
-            # 1. Adaptive threshold
-            thr_adapt = cv2.adaptiveThreshold(
-                sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
-            )
+            # 2. Denoise
+            img = cv2.fastNlMeansDenoising(img, h=10)
             
-            # 2. Otsu threshold
-            _, thr_otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # 3. Create variants - but fewer of them
+            variants = []
             
-            # 3. Inverted Otsu (for dark text on light background issues)
-            thr_otsu_inv = cv2.bitwise_not(thr_otsu)
+            # Original enhanced
+            variants.append(("enhanced", img))
             
-            # Small morphology to remove noise
-            kernel = np.ones((1, 1), np.uint8)
-            thr_adapt = cv2.morphologyEx(thr_adapt, cv2.MORPH_OPEN, kernel, iterations=1)
-            thr_otsu = cv2.morphologyEx(thr_otsu, cv2.MORPH_OPEN, kernel, iterations=1)
-            thr_otsu_inv = cv2.morphologyEx(thr_otsu_inv, cv2.MORPH_OPEN, kernel, iterations=1)
+            # Otsu threshold
+            _, otsu = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            variants.append(("otsu", otsu))
             
-            # Create variant list
-            variants = [
-                ("original_sharp", sharp),
-                ("adaptive_thresh", thr_adapt),
-                ("otsu_thresh", thr_otsu),
-                ("otsu_inverted", thr_otsu_inv)
-            ]
+            # Adaptive threshold
+            adaptive = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+            variants.append(("adaptive", adaptive))
             
-            # Save debug images if enabled
+            # Save debug if needed
             if DEBUG_OCR:
                 try:
                     os.makedirs("results", exist_ok=True)
                     for i, (name, variant) in enumerate(variants):
                         cv2.imwrite(f"results/_debug_{name}.png", variant)
-                except Exception as e:
-                    logger.debug(f"Could not save debug images: {e}")
+                except Exception:
+                    pass
             
-            # OCR configuration sets - ordered by effectiveness
-            base_cfg = "-l eng --oem 3 -c preserve_interword_spaces=1 -c user_defined_dpi=300"
-            psm_modes = [
-                ("6", "uniform_block"),  # Most common for documents
-                ("4", "single_column"),  # Good for certificates
-                ("12", "sparse_text"),   # For scattered text
-                ("11", "single_line"),   # For single line detection
-                ("7", "single_word"),    # For individual words
-                ("3", "auto")           # Fallback
+            # Simplified OCR configs - focus on most reliable ones
+            configs = [
+                ("--psm 6 -l eng --oem 3", "block"),
+                ("--psm 4 -l eng --oem 3", "column"),  
+                ("--psm 3 -l eng --oem 3", "auto")
             ]
             
-            deadline = time.monotonic() + 6.0  # Total timeout
             best_text = ""
-            best_score = -1.0
+            best_len = 0
+            timeout_per_try = 8.0  # Longer timeout per attempt
             
-            def run_ocr_variant(pil_img, psm, psm_name, per_call_timeout=1.8):
-                """Run OCR on a single variant with scoring"""
-                try:
-                    # Get detailed OCR data with confidences
-                    data = pytesseract.image_to_data(
-                        pil_img,
-                        config=f"{base_cfg} --psm {psm}",
-                        output_type=Output.DICT,
-                        timeout=per_call_timeout
-                    )
-                    
-                    # Extract words and filter out low confidence
-                    words = []
-                    confidences = []
-                    
-                    for i in range(len(data.get("text", []))):
-                        word = data["text"][i].strip()
-                        conf = int(data["conf"][i]) if data["conf"][i] != '-1' else 0
-                        
-                        if word and conf > 30:  # Only keep words with reasonable confidence
-                            words.append(word)
-                            confidences.append(conf)
-                    
-                    text = " ".join(words)
-                    mean_conf = float(np.mean(confidences)) if confidences else 0.0
-                    
-                    # Composite scoring
-                    length_score = min(len(text) / 200.0, 1.0)  # Normalize length
-                    conf_score = mean_conf / 100.0
-                    
-                    # Bonus for finding typical insurance document words
-                    bonus_words = ['insurance', 'liability', 'policy', 'certificate', 'expires', 'valid', 'until']
-                    word_bonus = sum(0.1 for word in bonus_words if word.lower() in text.lower())
-                    
-                    final_score = (conf_score * 0.6) + (length_score * 0.3) + min(word_bonus, 0.3)
-                    
-                    logger.info(f"OCR PSM {psm} ({psm_name}): len={len(text)}, conf={mean_conf:.1f}, score={final_score:.3f}")
-                    return text, final_score, mean_conf
-                    
-                except RuntimeError as e:
-                    if "timeout" in str(e).lower():
-                        logger.warning(f"OCR timeout for PSM {psm}")
-                        return "", 0.0, 0.0
-                    raise
-                except Exception as e:
-                    logger.debug(f"OCR failed for PSM {psm}: {e}")
-                    return "", 0.0, 0.0
-            
-            # Try each variant with each PSM mode
+            # Try each variant with each config
             for variant_name, variant_img in variants:
-                if time.monotonic() > deadline:
-                    break
-                    
                 pil_img = Image.fromarray(variant_img)
                 
-                for psm, psm_name in psm_modes:
-                    if time.monotonic() > deadline:
-                        break
-                    
-                    text, score, mean_conf = run_ocr_variant(pil_img, psm, psm_name)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_text = text
-                        logger.info(f"New best: {variant_name} + PSM{psm} (score: {score:.3f})")
-                    
-                    # Early exit for very good results
-                    if mean_conf >= 75 and len(text) >= 100:
-                        logger.info(f"Early exit - excellent result found")
-                        return text
-                    
-                    # Good enough result - continue for a bit more but lower threshold
-                    if score > 0.7 and len(text) >= 50:
-                        break  # Move to next variant
+                for config, config_name in configs:
+                    try:
+                        start = time.time()
+                        text = pytesseract.image_to_string(
+                            pil_img, 
+                            config=config,
+                            timeout=timeout_per_try
+                        ).strip()
+                        
+                        elapsed = time.time() - start
+                        logger.info(f"OCR {variant_name}+{config_name}: {len(text)} chars in {elapsed:.1f}s")
+                        
+                        # Keep the longest reasonable result
+                        if len(text) > best_len and len(text) > 10:  # At least 10 chars
+                            best_text = text
+                            best_len = len(text)
+                            
+                        # Early exit if we got good text
+                        if len(text) > 100:
+                            logger.info(f"Good result found early: {len(text)} characters")
+                            return text
+                            
+                    except RuntimeError as e:
+                        if "timeout" in str(e).lower():
+                            logger.warning(f"OCR timeout: {variant_name}+{config_name}")
+                        else:
+                            logger.warning(f"OCR error: {variant_name}+{config_name}: {e}")
+                        continue
+                    except Exception as e:
+                        logger.debug(f"OCR failed: {variant_name}+{config_name}: {e}")
+                        continue
             
-            if best_text.strip():
-                logger.info(f"OCR completed. Best score: {best_score:.3f}, length: {len(best_text)}")
-                return best_text.strip()
+            # Fallback: Try simple approach if nothing worked
+            if not best_text or len(best_text) < 20:
+                logger.info("Trying fallback simple OCR...")
+                try:
+                    # Very simple approach
+                    pil_simple = Image.open(image_path).convert('L')
+                    # Resize if too big
+                    if max(pil_simple.size) > 1000:
+                        pil_simple.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+                    
+                    fallback_text = pytesseract.image_to_string(
+                        pil_simple, 
+                        config='--psm 6 -l eng',
+                        timeout=10
+                    ).strip()
+                    
+                    if len(fallback_text) > len(best_text):
+                        best_text = fallback_text
+                        logger.info(f"Fallback OCR worked: {len(best_text)} chars")
+                        
+                except Exception as e:
+                    logger.debug(f"Fallback OCR also failed: {e}")
+            
+            if best_text and len(best_text) > 5:
+                logger.info(f"OCR completed successfully: {len(best_text)} characters extracted")
+                return best_text
             else:
                 logger.warning(f"OCR failed to extract meaningful text from {image_path}")
                 return ""
