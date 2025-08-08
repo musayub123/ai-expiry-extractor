@@ -24,7 +24,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Performance settings for Render free tier
-ENV OMP_NUM_THREADS=2
+ENV OMP_NUM_THREADS=1
 ENV OPENCV_LOG_LEVEL=ERROR
 
-CMD gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 30 --keep-alive 2 app:app
+# Updated CMD with longer timeout and single thread
+CMD gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 1 --timeout 120 --keep-alive 2 --max-requests 100 --max-requests-jitter 10 app:app
