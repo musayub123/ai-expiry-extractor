@@ -134,47 +134,74 @@ class DocumentProcessor:
             return ""
     
     def extract_text_from_image(self, image_path: str) -> str:
-        """Extract text from image with timeout protection"""
-        import signal
-        
-        class TimeoutError(Exception):
-            pass
-        
-        def timeout_handler(signum, frame):
-            raise TimeoutError("OCR processing timeout")
-        
+        """Extract text from image with safe timeouts (no OS signals)."""
+        import time
+        import cv2
+        import numpy as np
+        from PIL import Image
+    
         try:
-            # Set 20-second total timeout for entire image processing
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(20)
-            
-            # Check Tesseract availability
+            # Sanity: ensure tesseract exists
             try:
                 pytesseract.get_tesseract_version()
             except pytesseract.TesseractNotFoundError:
-                raise Exception("Tesseract OCR is not installed")
-            
-            # Try OpenCV first, fallback to PIL
-            try:
-                import cv2
-                result = self._extract_with_opencv(image_path)
-            except ImportError:
-                logger.warning("OpenCV not available, using PIL")
-                result = self._extract_with_pil(image_path)
-            except TimeoutError:
-                logger.warning("OpenCV OCR timed out, trying PIL fallback")
-                result = self._extract_with_pil(image_path)
-            
-            return result
-            
-        except TimeoutError:
-            logger.error(f"Total OCR timeout for {image_path}")
-            return ""
+                logger.error("Tesseract OCR is not installed/visible at runtime")
+                return ""
+    
+            # Load & quick preprocess (fast!)
+            pil = Image.open(image_path).convert("L")
+            # Cap size to speed up OCR
+            max_dim = 1800
+            if max(pil.size) > max_dim:
+                scale = max_dim / float(max(pil.size))
+                pil = pil.resize((int(pil.width * scale), int(pil.height * scale)), Image.LANCZOS)
+    
+            arr = np.array(pil)
+            # Light binarization + denoise
+            arr = cv2.adaptiveThreshold(arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY, 35, 11)
+            arr = cv2.medianBlur(arr, 3)
+            pil_proc = Image.fromarray(arr)
+    
+            # Try a few OCR configs with per-call timeouts
+            configs = [
+                "--oem 3 --psm 6 -l eng",  # block of text
+                "--oem 3 --psm 4 -l eng",  # single column
+                "--oem 3 --psm 3 -l eng",  # auto
+            ]
+    
+            best = ""
+            overall_deadline = time.monotonic() + 20.0  # 20s budget for the whole image
+    
+            for cfg in configs:
+                if time.monotonic() > overall_deadline:
+                    logger.warning("OCR overall timeout budget exceeded")
+                    break
+    
+                try:
+                    # pytesseract supports timeout — raises RuntimeError on hit
+                    txt = pytesseract.image_to_string(pil_proc, config=cfg, timeout=8).strip()
+                    if len(txt) > len(best):
+                        best = txt
+                    if len(txt) >= 50:  # early exit if decent text
+                        logger.info(f"OCR succeeded with config: {cfg}")
+                        break
+                except RuntimeError as e:
+                    # pytesseract uses RuntimeError for timeouts
+                    if "timeout" in str(e).lower():
+                        logger.warning(f"OCR config timed out: {cfg}")
+                        continue
+                    logger.error(f"OCR runtime error: {e}")
+                    continue
+                except Exception as e:
+                    logger.warning(f"OCR config failed ({cfg}): {e}")
+                    continue
+    
+            return best
+    
         except Exception as e:
             logger.error(f"OCR failed for {image_path}: {e}")
             return ""
-        finally:
-            signal.alarm(0)  # Cancel the alarm
     
     def _extract_with_opencv(self, image_path: str) -> str:
         """Fast OCR with timeout and multiple fallbacks"""
