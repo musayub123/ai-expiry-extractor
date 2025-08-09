@@ -1,9 +1,9 @@
-# extractor.py - Targeted improvements without breaking existing functionality
+# extractor.py - Bulletproof 3-tier OCR pipeline
 import re
 import fitz  # PyMuPDF
 import pytesseract
 import os
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 from dateutil import parser
 from datetime import datetime, timedelta
 import logging
@@ -13,15 +13,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import time
+import cv2
+import numpy as np
+import requests
+import base64
 
 # Set Tesseract path
 pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
 
-# ---- IMPROVED CONFIG ----
+# ---- CONFIG ----
 DATE_CONTEXT_KEYWORDS = {
     'high_priority': ['expiry', 'expires', 'expiration', 'valid until', 'coverage ends', 'end date', 'cover until', 'policy expires'],
     'medium_priority': ['renewal', 'term end', 'policy end', 'certificate valid', 'coverage period'],
-    'start_date_penalty': ['commencement', 'start', 'effective', 'issue', 'issued', 'policy date', 'from', 'date of commencement']  # Added specific phrase
+    'start_date_penalty': ['commencement', 'start', 'effective', 'issue', 'issued', 'policy date', 'from', 'date of commencement']
 }
 
 DOCUMENT_PATTERNS = {
@@ -54,14 +58,27 @@ DOCUMENT_PATTERNS = {
     }
 }
 
+# Insurance keywords for quality gates
+INSURANCE_KEYWORDS = [
+    'insurance', 'liability', 'policy', 'certificate', 'coverage', 'premium',
+    'insurer', 'insured', 'policyholder', 'indemnity', 'employer', 'public', 'professional'
+]
+
 IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".tiff", ".bmp"]
 PDF_EXTENSIONS = [".pdf"]
+
+# Cloud OCR config (set these in environment variables)
+GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AZURE_VISION_KEY = os.getenv("AZURE_VISION_KEY")
+AZURE_VISION_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT")
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class DocumentProcessor:
+class ThreeTierOCRProcessor:
     def __init__(self, cache_dir: str = ".cache"):
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
@@ -72,172 +89,337 @@ class DocumentProcessor:
         content = f"{file_path}_{stat.st_mtime}_{stat.st_size}"
         return hashlib.md5(content.encode()).hexdigest()
     
-    def _load_from_cache(self, cache_key: str) -> Optional[str]:
-        """Load extracted text from cache"""
-        cache_file = os.path.join(self.cache_dir, f"{cache_key}.txt")
+    def _load_from_cache(self, cache_key: str) -> Optional[Dict]:
+        """Load cached extraction result"""
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
         if os.path.exists(cache_file):
             with open(cache_file, 'r', encoding='utf-8') as f:
-                return f.read()
+                return json.load(f)
         return None
     
-    def _save_to_cache(self, cache_key: str, text: str):
-        """Save extracted text to cache"""
-        cache_file = os.path.join(self.cache_dir, f"{cache_key}.txt")
+    def _save_to_cache(self, cache_key: str, result: Dict):
+        """Save extraction result to cache"""
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
         with open(cache_file, 'w', encoding='utf-8') as f:
-            f.write(text)
+            json.dump(result, f, ensure_ascii=False, indent=2)
 
-    def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Extract text from PDF with fallback to OCR for image-based PDFs"""
+    def _count_keywords(self, text: str) -> int:
+        """Count insurance-related keywords in text"""
+        text_lower = text.lower()
+        return sum(1 for keyword in INSURANCE_KEYWORDS if keyword in text_lower)
+    
+    def _has_dates(self, text: str) -> bool:
+        """Check if text contains date patterns"""
+        date_patterns = [
+            r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
+            r'\d{4}-\d{2}-\d{2}',
+            r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}'
+        ]
+        for pattern in date_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        return False
+    
+    def _should_fallback_to_cloud(self, text: str, tier: str) -> bool:
+        """Decide if we should fallback to cloud OCR"""
+        if not text.strip():
+            logger.info(f"{tier} failed: No text extracted")
+            return True
+            
+        char_count = len(text)
+        keyword_count = self._count_keywords(text)
+        has_dates = self._has_dates(text)
+        
+        logger.info(f"{tier} results: {char_count} chars, {keyword_count} keywords, dates: {has_dates}")
+        
+        # Strict quality gates
+        if char_count < 250:
+            logger.info(f"{tier} fallback: Too few characters ({char_count} < 250)")
+            return True
+            
+        if keyword_count < 2:
+            logger.info(f"{tier} fallback: Too few keywords ({keyword_count} < 2)")
+            return True
+            
+        if not has_dates:
+            logger.info(f"{tier} fallback: No dates found")
+            return True
+            
+        logger.info(f"{tier} passed quality gates")
+        return False
+
+    def extract_text_from_pdf(self, pdf_path: str) -> Dict:
+        """TIER 0: PDF text extraction with fallback pipeline"""
+        logger.info(f"Starting 3-tier extraction for PDF: {pdf_path}")
+        
         try:
             doc = fitz.open(pdf_path)
-            text = ""
+            all_text = ""
+            processing_log = []
             
             for page_num, page in enumerate(doc):
-                page_text = page.get_text()
+                logger.info(f"Processing page {page_num + 1}")
                 
-                # If page has very little text, it might be image-based
-                if len(page_text.strip()) < 50:
-                    try:
-                        # Convert page to image and OCR
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x scale
-                        img_data = pix.tobytes("ppm")
-                        img = Image.open(io.BytesIO(img_data))
-                        ocr_text = self._ocr_image(img)
-                        text += f"\n--- PAGE {page_num + 1} (OCR) ---\n{ocr_text}\n"
-                    except Exception as e:
-                        logger.warning(f"OCR failed for page {page_num + 1}: {e}")
-                        text += page_text
+                # TIER 0: Try native PDF text first
+                page_text = page.get_text()
+                processing_log.append(f"Page {page_num + 1} - Tier 0: {len(page_text)} chars")
+                
+                if len(page_text.strip()) >= 300 and self._count_keywords(page_text) >= 2:
+                    logger.info(f"Page {page_num + 1}: Tier 0 SUCCESS - using PDF text")
+                    all_text += f"\n--- PAGE {page_num + 1} (PDF_TEXT) ---\n{page_text}\n"
+                    processing_log.append(f"Page {page_num + 1} - Used: PDF_TEXT")
                 else:
-                    text += f"\n--- PAGE {page_num + 1} ---\n{page_text}\n"
+                    # Convert page to image for OCR tiers
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 300 DPI equivalent
+                    img_data = pix.tobytes("png")
+                    img = Image.open(io.BytesIO(img_data))
+                    pix = None  # Free memory immediately
+                    
+                    ocr_result = self._process_image_with_tiers(img, f"PDF_page_{page_num + 1}")
+                    all_text += f"\n--- PAGE {page_num + 1} ({ocr_result['source'].upper()}) ---\n{ocr_result['text']}\n"
+                    processing_log.extend(ocr_result['log'])
+                    
+                    img = None  # Free memory
             
             doc.close()
-            return text
+            
+            return {
+                'text': all_text,
+                'source': 'HYBRID',
+                'log': processing_log,
+                'success': True
+            }
+            
         except Exception as e:
-            logger.error(f"Failed to read PDF {pdf_path}: {e}")
-            return ""
+            logger.error(f"PDF processing failed: {e}")
+            return {
+                'text': '',
+                'source': 'ERROR', 
+                'log': [f"PDF processing failed: {e}"],
+                'success': False
+            }
     
-    def extract_text_from_image(self, image_path: str) -> str:
-        """Extract text from image file"""
+    def extract_text_from_image(self, image_path: str) -> Dict:
+        """Process image through tier pipeline"""
+        logger.info(f"Starting 3-tier extraction for image: {image_path}")
+        
         try:
             img = Image.open(image_path)
-            return self._ocr_image(img)
+            result = self._process_image_with_tiers(img, os.path.basename(image_path))
+            img = None  # Free memory
+            return result
         except Exception as e:
-            logger.error(f"Failed to read image {image_path}: {e}")
-            return ""
+            logger.error(f"Image processing failed: {e}")
+            return {
+                'text': '',
+                'source': 'ERROR',
+                'log': [f"Image processing failed: {e}"],
+                'success': False
+            }
     
-    def _ocr_image(self, img: Image.Image) -> str:
-        """OCR an image with MINIMAL improvements"""
-        logger.info(f"Starting OCR on image size: {img.size}")
+    def _process_image_with_tiers(self, img: Image.Image, filename: str) -> Dict:
+        """Process single image through TIER 1 → TIER 2 pipeline"""
+        
+        # TIER 1: Enhanced Tesseract OCR
+        logger.info(f"{filename}: Trying Tier 1 (Enhanced Tesseract)")
+        tier1_result = self._tier1_enhanced_tesseract(img)
+        
+        if not self._should_fallback_to_cloud(tier1_result['text'], 'Tier1'):
+            return {
+                'text': tier1_result['text'],
+                'source': 'tesseract_enhanced',
+                'log': [f"{filename} - Tier 1 SUCCESS: {len(tier1_result['text'])} chars"],
+                'success': True
+            }
+        
+        # TIER 2: Cloud OCR fallback
+        logger.info(f"{filename}: Falling back to Tier 2 (Cloud OCR)")
+        tier2_result = self._tier2_cloud_ocr(img)
+        
+        if tier2_result['success']:
+            return {
+                'text': tier2_result['text'],
+                'source': 'cloud_ocr',
+                'log': [
+                    f"{filename} - Tier 1 failed quality gates",
+                    f"{filename} - Tier 2 SUCCESS: {len(tier2_result['text'])} chars"
+                ],
+                'success': True
+            }
+        
+        # Fallback to Tier 1 result even if poor quality
+        return {
+            'text': tier1_result['text'],
+            'source': 'tesseract_fallback',
+            'log': [
+                f"{filename} - Tier 1 failed quality gates",
+                f"{filename} - Tier 2 failed, using Tier 1 anyway"
+            ],
+            'success': False
+        }
+    
+    def _tier1_enhanced_tesseract(self, img: Image.Image) -> Dict:
+        """TIER 1: Enhanced Tesseract with preprocessing"""
+        try:
+            # Convert PIL to OpenCV
+            img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            
+            # Preprocess for better OCR
+            processed_img = self._preprocess_for_ocr(img_cv)
+            
+            # Convert back to PIL
+            processed_pil = Image.fromarray(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB))
+            
+            # Try OCR with multiple PSM modes
+            best_text = ""
+            best_score = 0
+            
+            for psm in [6, 4]:  # Block, then column
+                try:
+                    config = f'--psm {psm} -l eng --oem 1'
+                    text = pytesseract.image_to_string(processed_pil, config=config, timeout=10)
+                    
+                    if text.strip():
+                        score = len(text) + self._count_keywords(text) * 50
+                        if score > best_score:
+                            best_score = score
+                            best_text = text
+                            
+                except Exception as e:
+                    logger.warning(f"PSM {psm} failed: {e}")
+                    continue
+            
+            return {'text': best_text, 'success': True}
+            
+        except Exception as e:
+            logger.error(f"Tier 1 processing failed: {e}")
+            return {'text': '', 'success': False}
+    
+    def _preprocess_for_ocr(self, img_cv):
+        """Enhanced preprocessing for better OCR"""
+        # Convert to grayscale
+        if len(img_cv.shape) == 3:
+            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img_cv
+            
+        # Resize if too large (keep aspect ratio)
+        height, width = gray.shape
+        if width > 2500 or height > 2500:
+            scale = min(2500 / width, 2500 / height)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            gray = cv2.resize(gray, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
+        
+        # Deskew (simple rotation based on horizontal lines)
+        try:
+            edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+            lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=10)
+            
+            if lines is not None and len(lines) > 5:
+                angles = []
+                for line in lines[:20]:  # Use first 20 lines
+                    x1, y1, x2, y2 = line[0]
+                    angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
+                    angles.append(angle)
+                
+                if angles:
+                    median_angle = np.median(angles)
+                    if abs(median_angle) > 0.5 and abs(median_angle) < 45:  # Only correct small skews
+                        center = (gray.shape[1] // 2, gray.shape[0] // 2)
+                        rotation_matrix = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+                        gray = cv2.warpAffine(gray, rotation_matrix, (gray.shape[1], gray.shape[0]), 
+                                            flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        except:
+            pass  # Skip deskewing if it fails
+        
+        # Adaptive thresholding for better contrast
+        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                     cv2.THRESH_BINARY, 11, 2)
+        
+        # Light denoising
+        denoised = cv2.medianBlur(binary, 3)
+        
+        # Slight morphological cleaning
+        kernel = np.ones((2, 2), np.uint8)
+        cleaned = cv2.morphologyEx(denoised, cv2.MORPH_CLOSE, kernel)
+        
+        # Convert back to BGR for consistency
+        return cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
+    
+    def _tier2_cloud_ocr(self, img: Image.Image) -> Dict:
+        """TIER 2: Cloud OCR fallback (Google Vision API)"""
+        if not GOOGLE_VISION_API_KEY:
+            logger.warning("No Google Vision API key configured")
+            return {'text': '', 'success': False}
         
         try:
-            pytesseract.get_tesseract_version()
-        except Exception:
-            logger.error("Tesseract not available")
-            return ""
-        
-        # Convert to grayscale
-        if img.mode != 'L':
-            img = img.convert('L')
-        
-        # Only resize if genuinely too large
-        width, height = img.size
-        if width > 2000 or height > 2000:
-            scale = min(2000 / width, 2000 / height)
-            new_size = (int(width * scale), int(height * scale))
-            img = img.resize(new_size, Image.Resampling.LANCZOS)
-            logger.info(f"Resized to: {img.size}")
-        
-        # MINIMAL enhancement - just slight contrast boost
-        enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(1.3)  # Slightly higher than before
-        
-        # Try fewer PSM modes to avoid timeouts
-        psm_modes = [6, 4]  # Just block and column
-        timeout = 10  # Shorter timeout
-        
-        best_text = ""
-        best_score = 0
-        
-        for psm in psm_modes:
-            try:
-                logger.info(f"Trying PSM {psm}...")
-                config = f'--psm {psm} -l eng --oem 1'
-                
-                text = pytesseract.image_to_string(
-                    img,
-                    config=config,
-                    timeout=timeout
-                ).strip()
-                
-                if text:
-                    score = self._score_text(text)
-                    logger.info(f"PSM {psm}: {len(text)} chars, score: {score:.3f}")
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_text = text
-                
-            except Exception as e:
-                logger.warning(f"PSM {psm} failed: {e}")
-                continue
-        
-        if best_text:
-            logger.info(f"OCR SUCCESS: {len(best_text)} characters")
-            return best_text
-        else:
-            logger.warning("No text extracted")
-            return ""
-    
-    def _score_text(self, text: str) -> float:
-        """SAME scoring as before but with slight improvements"""
-        if not text.strip():
-            return 0.0
-        
-        score = 0.0
-        
-        # Basic word quality
-        words = text.split()
-        if words:
-            valid_words = sum(1 for word in words if re.match(r'^[A-Za-z0-9.,;:!?()-]+$', word))
-            score += (valid_words / len(words)) * 0.4
-        
-        # Date bonus
-        if re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text):
-            score += 0.4
-        
-        # Insurance keywords bonus
-        text_lower = text.lower()
-        keywords = ['liability', 'insurance', 'certificate', 'policy', 'expiry', 'employer']  # Added 'employer'
-        found = sum(1 for kw in keywords if kw in text_lower)
-        score += (found / len(keywords)) * 0.2
-        
-        return min(1.0, score)
-    
+            # Convert image to base64
+            img_buffer = io.BytesIO()
+            img.save(img_buffer, format='PNG')
+            img_base64 = base64.b64encode(img_buffer.getvalue()).decode()
+            
+            # Call Google Vision API
+            url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+            
+            payload = {
+                "requests": [{
+                    "image": {"content": img_base64},
+                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]
+                }]
+            }
+            
+            response = requests.post(url, json=payload, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if 'responses' in result and result['responses']:
+                    text_annotations = result['responses'][0].get('textAnnotations', [])
+                    if text_annotations:
+                        extracted_text = text_annotations[0].get('description', '')
+                        logger.info(f"Cloud OCR extracted {len(extracted_text)} characters")
+                        return {'text': extracted_text, 'success': True}
+            
+            logger.error(f"Cloud OCR failed: {response.status_code} - {response.text}")
+            return {'text': '', 'success': False}
+            
+        except Exception as e:
+            logger.error(f"Cloud OCR exception: {e}")
+            return {'text': '', 'success': False}
+
     def get_all_text(self, file_path: str) -> str:
-        """Extract text from file with caching"""
+        """Main entry point - extract text with 3-tier pipeline"""
         cache_key = self._get_cache_key(file_path)
-        cached_text = self._load_from_cache(cache_key)
+        cached_result = self._load_from_cache(cache_key)
         
-        if cached_text is not None:
-            logger.info(f"Using cached text for {file_path}")
-            return cached_text
+        if cached_result is not None:
+            logger.info(f"Using cached result for {file_path}")
+            return cached_result.get('text', '')
         
         ext = os.path.splitext(file_path)[1].lower()
         
         if ext in PDF_EXTENSIONS:
-            text = self.extract_text_from_pdf(file_path)
+            result = self.extract_text_from_pdf(file_path)
         elif ext in IMAGE_EXTENSIONS:
-            text = self.extract_text_from_image(file_path)
+            result = self.extract_text_from_image(file_path)
         else:
             raise ValueError(f"Unsupported file type: {ext}")
         
-        # Only cache if we got meaningful text
-        if text and text.strip():
-            self._save_to_cache(cache_key, text)
+        # Cache the full result
+        if result.get('text'):
+            self._save_to_cache(cache_key, result)
         
-        return text
+        # Log the processing summary
+        logger.info(f"File: {os.path.basename(file_path)}")
+        logger.info(f"Source: {result.get('source', 'unknown')}")
+        logger.info(f"Text length: {len(result.get('text', ''))}")
+        for log_entry in result.get('log', []):
+            logger.info(f"  {log_entry}")
+        
+        return result.get('text', '')
 
 class DateExtractor:
+    """UNCHANGED - keeping your existing date extraction logic"""
     def __init__(self):
         self.date_patterns = [
             r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
@@ -247,7 +429,7 @@ class DateExtractor:
         ]
     
     def find_all_dates_with_context(self, text: str, window_size: int = 200) -> List[Dict]:
-        """Find all dates with context - SAME as before"""
+        """Find all dates with context"""
         candidates = []
         
         for pattern in self.date_patterns:
@@ -258,7 +440,7 @@ class DateExtractor:
                 
                 try:
                     parsed_date = parser.parse(match.group(), dayfirst=True)
-                    relevance = self._calculate_relevance_improved(context, match.group())  # IMPROVED
+                    relevance = self._calculate_relevance_improved(context, match.group())
                     
                     candidates.append({
                         'raw_date': match.group(),
@@ -325,7 +507,7 @@ class DateExtractor:
         return max(0.0, score)
     
     def select_best_expiry_date(self, candidates: List[Dict]) -> Optional[Dict]:
-        """SAME selection logic as before"""
+        """Select best expiry date"""
         if not candidates:
             return None
         
@@ -357,6 +539,7 @@ class DateExtractor:
         return valid[0]
 
 class DocumentTypeClassifier:
+    """UNCHANGED - keeping your existing classification logic"""
     def __init__(self):
         self.patterns = DOCUMENT_PATTERNS
     
@@ -418,15 +601,16 @@ class DocumentTypeClassifier:
         return best_match, final_score
 
 class EnhancedDocumentExtractor:
+    """UNCHANGED API - but now uses 3-tier OCR processor"""
     def __init__(self, cache_dir: str = ".cache"):
-        self.processor = DocumentProcessor(cache_dir)
+        self.processor = ThreeTierOCRProcessor(cache_dir)  # New processor
         self.date_extractor = DateExtractor()
         self.classifier = DocumentTypeClassifier()
     
     def extract_from_file(self, file_path: str) -> Dict:
-        """Extract expiry information from file - SAME structure as before"""
+        """Extract expiry information from file - SAME API"""
         try:
-            # Extract text
+            # Extract text using 3-tier pipeline
             text = self.processor.get_all_text(file_path)
             
             if not text.strip():
@@ -483,31 +667,24 @@ class EnhancedDocumentExtractor:
                 "candidates": []
             }
     
-    def extract_from_files(self, file_paths: List[str], max_workers: int = 4) -> List[Dict]:
-        """Extract from multiple files"""
+    def extract_from_files(self, file_paths: List[str], max_workers: int = 1) -> List[Dict]:
+        """Extract from multiple files - REDUCED max_workers for 512MB RAM"""
         results = []
         
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_file = {
-                executor.submit(self.extract_from_file, file_path): file_path
-                for file_path in file_paths
-            }
-            
-            for future in as_completed(future_to_file):
-                file_path = future_to_file[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-                    logger.info(f"Processed {file_path}: {result['status']}")
-                except Exception as e:
-                    logger.error(f"Failed to process {file_path}: {e}")
-                    results.append({
-                        "file": os.path.basename(file_path),
-                        "status": "error",
-                        "error": str(e),
-                        "document_type": "Unknown",
-                        "expiry_date": None,
-                        "confidence": 0.0
-                    })
-        
+        # Process sequentially to avoid memory issues on 512MB
+        for file_path in file_paths:
+            try:
+                result = self.extract_from_file(file_path)
+                results.append(result)
+                logger.info(f"Processed {file_path}: {result['status']}")
+            except Exception as e:
+                logger.error(f"Failed to process {file_path}: {e}")
+                results.append({
+                    "file": os.path.basename(file_path),
+                    "status": "error", 
+                    "error": str(e),
+                    "document_type": "Unknown",
+                    "expiry_date": None,
+                    "confidence": 0
+                })
         return results
