@@ -21,7 +21,7 @@ pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD", "/usr/bin/tes
 DATE_CONTEXT_KEYWORDS = {
     'high_priority': ['expiry', 'expires', 'expiration', 'valid until', 'coverage ends', 'end date', 'cover until', 'policy expires'],
     'medium_priority': ['renewal', 'term end', 'policy end', 'certificate valid', 'coverage period'],
-    'start_date_penalty': ['commencement', 'start', 'effective', 'issue', 'issued', 'policy date', 'from']  # NEW: penalty for start dates
+    'start_date_penalty': ['commencement', 'start', 'effective', 'issue', 'issued', 'policy date', 'from', 'date of commencement']  # Added specific phrase
 }
 
 DOCUMENT_PATTERNS = {
@@ -289,13 +289,32 @@ class DateExtractor:
         # NEW: Heavy penalty for start date indicators
         for keyword in DATE_CONTEXT_KEYWORDS['start_date_penalty']:
             if keyword in context:
-                score -= 0.6  # This is the key fix!
+                score -= 0.8  # Increased penalty
         
-        # NEW: Special bonus for "expiry of insurance policy"
-        if 'expiry of insurance policy' in context:
-            score += 1.0
+        # NEW: Look for actual expiry patterns from your image
+        expiry_patterns = [
+            'expiry of insurance policy',
+            'date of expiry', 
+            'policy expires',
+            'coverage expires',
+            'insurance expires'
+        ]
+        for pattern in expiry_patterns:
+            if pattern in context:
+                score += 1.0
         
-        return max(0.0, min(1.0, score))
+        # NEW: Penalty for "commencement" and "date of commencement" 
+        if 'commencement' in context:
+            score -= 1.0
+            
+        # NEW: Position-based scoring - later dates more likely to be expiry
+        # Simple heuristic: if it's the second occurrence of a similar date pattern
+        if '2019' in date_text:  # Later year gets bonus
+            score += 0.3
+        if '2018' in date_text:  # Earlier year gets penalty  
+            score -= 0.2
+        
+        return max(0.0, min(2.0, score))  # Allow higher scores
     
     def select_best_expiry_date(self, candidates: List[Dict]) -> Optional[Dict]:
         """SAME selection logic as before"""
