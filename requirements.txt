@@ -9,3 +9,7 @@ python-dotenv==1.0.0
 opencv-python-headless==4.8.1.78
 numpy==1.24.3
 regex==2023.8.8
+aiohttp==3.8.5
+requests==2.31.0
+boto3==1.28.57
+
