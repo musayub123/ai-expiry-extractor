@@ -507,7 +507,7 @@ class DateExtractor:
         return max(0.0, score)
     
     def select_best_expiry_date(self, candidates: List[Dict]) -> Optional[Dict]:
-        """Select best expiry date"""
+        """FIXED: Deterministic expiry date selection"""
         if not candidates:
             return None
         
@@ -534,8 +534,13 @@ class DateExtractor:
             
             candidate['final_confidence'] = max(0.0, min(1.0, confidence))
         
-        # Return best candidate
-        valid.sort(key=lambda x: x['final_confidence'], reverse=True)
+        # DETERMINISTIC SELECTION WITH TIE-BREAKING
+        valid.sort(key=lambda x: (
+            x['final_confidence'],           # Primary: confidence score
+            x['parsed_date'],                # Tie-break 1: latest date wins
+            x['raw_date']                    # Tie-break 2: string comparison
+        ), reverse=True)
+        
         return valid[0]
 
 class DocumentTypeClassifier:
